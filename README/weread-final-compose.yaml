@@ -1,0 +1,39 @@
+services:
+  app:
+    image: jqknono/weread-challenge:latest
+    pull_policy: always
+    environment:
+      - WEREAD_REMOTE_BROWSER=http://selenium:4444
+      - WEREAD_DURATION=1
+      - WEREAD_AGREE_TERMS=false
+      - ENABLE_EMAIL=true
+      - EMAIL_SMTP=smtp.qq.com
+      - EMAIL_PORT=465
+      - EMAIL_USER=303235040@qq.com
+      - EMAIL_PASS=mretdolgpysnbigj
+      - EMAIL_FROM=303235040@qq.com
+      - EMAIL_TO=303235040@qq.com
+    volumes:
+      - ./.weread:/app/.weread
+    depends_on:
+      selenium:
+        condition: service_healthy
+    dns:
+      - 223.5.5.5
+  selenium:
+    image: selenium/standalone-chromium:latest
+    pull_policy: if_not_present
+    shm_size: 2gb
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - SE_ENABLE_TRACING=false
+      - SE_BIND_HOST=false
+      - SE_JAVA_DISABLE_HOSTNAME_VERIFICATION=false
+    dns:
+      - 223.5.5.5
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://selenium:4444/status"]
+      interval: 5s
+      timeout: 60s
+      retries: 10

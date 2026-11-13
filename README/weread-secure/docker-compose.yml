@@ -1,0 +1,57 @@
+# 微信读书挑战助手 —— 隐私加固版
+# 部署：把整个 weread-secure 目录放到 LXC 107 的 /opt/weread-secure，执行 docker compose up -d --build
+services:
+  app:
+    build: .
+    image: weread-challenge-secure:local
+    restart: "no"
+    environment:
+      WEREAD_REMOTE_BROWSER: http://selenium:4444
+      WEREAD_DURATION: "68"
+      WEREAD_SELECTION: "2"
+      # 遥测：源码已强制关闭，环境变量再兜一层
+      WEREAD_AGREE_TERMS: "false"
+      # 关闭对外 HTTP API（/qr 等接口），二维码改从 .weread/login.png 取
+      WEREAD_API_PORT: "0"
+      # 不落盘阅读截图（截图可能包含书架/昵称等个人信息）
+      WEREAD_SCREENSHOT: "false"
+      # 不启用邮件 / Bark 推送，避免登录链接经第三方服务中转
+      ENABLE_EMAIL: "false"
+    volumes:
+      - ./.weread:/app/.weread
+    # 域名级黑洞：即便以后代码变更，这些域名也解析到容器自身，无法外发
+    extra_hosts:
+      - "weread-challenge.techfetch.dev:127.0.0.1"
+      - "api.qrserver.com:127.0.0.1"
+      - "api.day.app:127.0.0.1"
+    depends_on:
+      selenium:
+        condition: service_healthy
+    dns:
+      - 223.5.5.5
+    networks:
+      - weread
+
+  selenium:
+    # 建议替换为固定版本 digest，避免 latest 漂移
+    image: selenium/standalone-chromium:latest
+    pull_policy: if_not_present
+    shm_size: 2gb
+    # 不挂载 /var/run/docker.sock（官方示例挂了，等于把宿主机 root 权限交给容器）
+    environment:
+      SE_ENABLE_TRACING: "false"
+      SE_BIND_HOST: "false"
+      SE_JAVA_DISABLE_HOSTNAME_VERIFICATION: "false"
+    dns:
+      - 223.5.5.5
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4444/status"]
+      interval: 5s
+      timeout: 60s
+      retries: 10
+    networks:
+      - weread
+
+networks:
+  weread:
+    driver: bridge

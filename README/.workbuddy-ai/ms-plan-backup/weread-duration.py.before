@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+# Script D -- daily random WEREAD_DURATION generator for weread-challenge.
+#   Name   : /usr/local/bin/weread-duration.py
+#   Caller : Script C /etc/systemd/system/weread-boot-start.service (ExecStartPre)
+#   Compose: /opt/stacks/weread-challenge/compose.yaml
+#   State  : /var/lib/weread-duration/plan.json
+#   Backup : /var/lib/weread-duration/compose.before.yaml
+#   Log    : /var/log/weread-duration.log
+#
+#   Rule   : once per calendar day (Asia/Shanghai), draw a truncated-normal
+#            INTEGER in [62,120] minutes whose MODE (most frequent value) is
+#            exactly 73, then atomically rewrite the WEREAD_DURATION line.
+#            73 is NOT the mean: mu is set directly to 73 and sigma=12min is
+#            the jitter. Since mu lies inside [62,120], truncation cannot move
+#            the mode; it only pushes the mean a few minutes higher (~76.8).
+#   Why    : CT 107 is stopped at 00:00 by Script A and started somewhere in
+#            08:00-08:30 by Script B. A 06:00 cron INSIDE CT 107 (the old
+#            weread-daily.py approach) can never fire. Boot time is the only
+#            reliable once-per-day point, and running as Script C's
+#            ExecStartPre guarantees the YAML is written BEFORE compose up.
+#   Note   : changing an environment variable does NOT require a docker build.
+#            The container only needs to be RECREATED, which Script C already
+#            does with `docker compose up -d --force-recreate app`.
+#   Added  : 2026-11-12
+#   Change : 2026-11-12 23:20 -- mean-calibration removed per user's
+#            clarification that "73" means the mode, not the average.
+#
+
+import argparse
+from collections import Counter
+import fcntl
+import json
+import math
+import os
+import random
+import re
+import shutil
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+BJ = timezone(timedelta(hours=8))
+
+MODE_MIN = 73.0              # the MOST FREQUENT duration, in minutes
+SIGMA = 12.0                 # jitter / spread; raise for wider scatter
+LO, HI = 62.0, 120.0        # hard inclusive bounds
+
+DEFAULT_COMPOSE = Path("/opt/stacks/weread-challenge/compose.yaml")
+DEFAULT_STATE = Path("/var/lib/weread-duration/plan.json")
+DEFAULT_BACKUP = Path("/var/lib/weread-duration/compose.before.yaml")
+LOG_FILE = Path("/var/log/weread-duration.log")
+LOCK_FILE = Path("/run/weread-duration.lock")
+
+# [ \t] rather than \s: never let the pattern swallow a newline and match
+# across lines. Exactly one such line must exist in compose.yaml.
+DURATION_RE = re.compile(
+    r"^([ \t]*-[ \t]*WEREAD_DURATION=)(\d+)([ \t]*(?:#[^\n]*)?)$", re.M
+)
+
+
+def bj_now():
+    return datetime.now(BJ)
+
+
+def norm_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def truncated_expectation(mu, sigma, lo, hi):
+    """Informational only: the mean is explicitly NOT the centre we target."""
+    a = (lo - mu) / sigma
+    b = (hi - mu) / sigma
+    z = norm_cdf(b) - norm_cdf(a)
+    if z <= 1e-12:
+        return hi if mu > hi else lo
+    return mu + sigma * (norm_pdf(a) - norm_pdf(b)) / z
+
+
+# For a truncated normal with lo <= mu <= hi, the density keeps its peak at
+# mu, so the MODE is exactly mu. No mean-calibration is wanted here.
+MU = MODE_MIN
+
+
+def truncated_normal(mu, sigma, lo, hi):
+    for _ in range(2000):
+        x = random.gauss(mu, sigma)
+        if lo <= x <= hi:
+            return x
+    return min(max(mu, lo), hi)
+
+
+def draw_duration():
+    x = truncated_normal(MU, SIGMA, LO, HI)
+    n = max(int(LO), min(int(HI), int(round(x))))
+    return n, x
+
+
+def log(msg, level="INFO"):
+    line = "%s [%s] %s" % (bj_now().strftime("%Y-%m-%d %H:%M:%S %z"), level, msg)
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    print(line)
+
+
+def load_state(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def current_duration(compose):
+    try:
+        text = compose.read_text(encoding="utf-8")
+    except OSError as e:
+        raise RuntimeError("cannot read %s: %s" % (compose, e))
+    hits = list(DURATION_RE.finditer(text))
+    if len(hits) != 1:
+        raise RuntimeError("expected exactly 1 WEREAD_DURATION line in %s, found %d"
+                           % (compose, len(hits)))
+    return int(hits[0].group(2)), text
+
+
+def apply_duration(compose, duration, backup, dry_run=False):
+    """Atomically set WEREAD_DURATION. Returns (old_value, changed)."""
+    cur, text = current_duration(compose)
+    if cur == duration:
+        return cur, False
+    new_text = DURATION_RE.sub(
+        lambda m: m.group(1) + str(duration) + m.group(3), text, count=1
+    )
+    if dry_run:
+        return cur, True
+    if backup:
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(compose, backup)
+    mode = compose.stat().st_mode & 0o7777
+    fd, tmpname = tempfile.mkstemp(prefix=".compose.", dir=str(compose.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmpname, mode)
+        os.replace(tmpname, compose)
+    except Exception:
+        try:
+            os.unlink(tmpname)
+        except OSError:
+            pass
+        raise
+    return cur, True
+
+
+def new_plan(n, sample):
+    return {
+        "date": bj_now().date().isoformat(),
+        "duration": n,
+        "sample": round(sample, 4),
+        "applied": False,
+        "applied_at_bj": None,
+        "mode": MODE_MIN,
+        "nominal_mu": round(MU, 4),
+        "sigma": SIGMA,
+        "bounds": [int(LO), int(HI)],
+        "note": "generated by Script D (mode=73, sigma=12min)",
+    }
+
+
+def cmd_plan(args):
+    n, sample = draw_duration()
+    state = new_plan(n, sample)
+    if args.dry_run:
+        print(json.dumps(state, indent=2, ensure_ascii=False))
+        return 0
+    save_state(args.state, state)
+    log("plan: WEREAD_DURATION=%d (sample=%.4f)" % (n, sample))
+    return 0
+
+
+def cmd_apply(args):
+    state = load_state(args.state)
+    if not state:
+        log("no plan found, run 'plan' first", "ERROR")
+        return 1
+    n = int(state["duration"])
+    old, changed = apply_duration(args.compose, n, args.backup, args.dry_run)
+    if args.dry_run:
+        log("DRY-RUN: would set WEREAD_DURATION %s -> %d" % (old, n))
+        return 0
+    state["applied"] = changed or bool(state.get("applied"))
+    state["applied_at_bj"] = bj_now().isoformat()
+    save_state(args.state, state)
+    log("apply: WEREAD_DURATION %s -> %d (changed=%s)" % (old, n, changed))
+    return 0
+
+
+def cmd_roll(args):
+    """plan + apply in one step; idempotent per calendar day."""
+    now = bj_now()
+    state = load_state(args.state)
+    if not args.force and state and state.get("date") == now.date().isoformat() \
+            and state.get("applied"):
+        n = int(state["duration"])
+        cur, _ = current_duration(args.compose)
+        if cur == n:
+            log("already applied today: WEREAD_DURATION=%d (skip)" % n)
+            return 0
+        log("state says applied but YAML has %s; re-applying %d" % (cur, n))
+        old, _ = apply_duration(args.compose, n, args.backup, args.dry_run)
+        log("re-applied WEREAD_DURATION %s -> %d" % (old, n))
+        return 0
+    n, sample = draw_duration()
+    state = new_plan(n, sample)
+    old, changed = apply_duration(args.compose, n, args.backup, args.dry_run)
+    if args.dry_run:
+        log("DRY-RUN: would set WEREAD_DURATION %s -> %d (sample=%.4f)"
+            % (old, n, sample))
+        print(json.dumps(state, indent=2, ensure_ascii=False))
+        return 0
+    state["applied"] = True
+    state["applied_at_bj"] = now.isoformat()
+    save_state(args.state, state)
+    log("roll: WEREAD_DURATION %s -> %d (sample=%.4f, mode=%.1f, sigma=%.1f)"
+        % (old, n, sample, MODE_MIN, SIGMA))
+    return 0
+
+
+def cmd_status(args):
+    cur, _ = current_duration(args.compose)
+    print(json.dumps({
+        "distribution": {
+            "bounds": [int(LO), int(HI)],
+            "mode": MODE_MIN,
+            "sigma": SIGMA,
+            "nominal_mu": round(MU, 4),
+            "mean_after_truncation_informational": round(
+                truncated_expectation(MU, SIGMA, LO, HI), 4),
+        },
+        "compose": str(args.compose),
+        "WEREAD_DURATION_in_yaml": cur,
+        "today_plan": load_state(args.state),
+        "now_bj": bj_now().isoformat(),
+    }, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_selftest(args):
+    n = 5000
+    vals = sorted(draw_duration()[0] for _ in range(n))
+    p5, p50, p95 = vals[int(0.05 * n)], vals[int(0.50 * n)], vals[int(0.95 * n)]
+    counts = Counter(vals)
+    modal_int, modal_count = counts.most_common(1)[0]
+    # The densest 5-minute sliding window should be centred on the mode.
+    masses = {c: sum(counts.get(c + d, 0) for d in (-2, -1, 0, 1, 2))
+              for c in range(int(LO) + 2, int(HI) - 1)}
+    peak5 = max(masses, key=masses.get)
+    mean = sum(vals) / float(n)
+    in_window = all(int(LO) <= v <= int(HI) for v in vals)
+    print("samples=%d mode=%dmin sigma=%.1fmin bounds=[%d,%d]"
+          % (n, int(MODE_MIN), SIGMA, int(LO), int(HI)))
+    print("nominal_mu=%.4f  mean_after_truncation=%.3f (informational, NOT the centre)"
+          % (MU, truncated_expectation(MU, SIGMA, LO, HI)))
+    print("min=%d P5=%d P50=%d P95=%d max=%d sampled_mean=%.3f"
+          % (vals[0], p5, p50, p95, vals[-1], mean))
+    print("modal_integer=%d (count=%d)  densest_5min_window_centre=%d  all_in_window=%s"
+          % (modal_int, modal_count, peak5, in_window))
+    ok = in_window and abs(peak5 - MODE_MIN) <= 2.0
+    print("SELFTEST %s" % ("OK" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+def main():
+    p = argparse.ArgumentParser(description="Script D: daily random WEREAD_DURATION")
+    p.add_argument("command", choices=["plan", "apply", "roll", "status", "selftest"])
+    p.add_argument("--compose", type=Path, default=DEFAULT_COMPOSE)
+    p.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    p.add_argument("--backup", type=Path, default=DEFAULT_BACKUP)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true")
+    args = p.parse_args()
+
+    lock = None
+    if args.command in ("plan", "apply", "roll"):
+        lock = LOCK_FILE.open("a+")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log("another instance holds the lock, skip", "WARN")
+            return 0
+
+    handlers = {
+        "plan": cmd_plan,
+        "apply": cmd_apply,
+        "roll": cmd_roll,
+        "status": cmd_status,
+        "selftest": cmd_selftest,
+    }
+    try:
+        return handlers[args.command](args)
+    except Exception as e:
+        log("%s failed: %s: %s" % (args.command, type(e).__name__, e), "ERROR")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

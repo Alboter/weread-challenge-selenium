@@ -1,0 +1,64 @@
+# Script C -- one-shot boot trigger for the weread-challenge app inside CT 107.
+#   Name  : /etc/systemd/system/weread-boot-start.service
+#   Why   : Script A stops CT 107 at 00:00 and Script B starts it at a random
+#           moment in 08:00-08:30 CST. The app/selenium containers use
+#           restart=no, so nothing would launch the reading task after boot.
+#   Rule  : run ONCE per boot, only after the Docker daemon is ready.
+#           Script D (ExecStartPre) rewrites ONLY the WEREAD_DURATION line in
+#           compose.yaml; the rest of the file and the restart policy stay put
+#           (app is a one-shot task container; restart=unless-stopped would
+#           loop it forever after each Exited(0)).
+#   Millis: Script D also draws a random start_offset_ms every day. The `wait`
+#           ExecStartPre sleeps exactly that many milliseconds, calibrated
+#           with perf_counter, so the app login timestamp never lands on a
+#           whole minute and the boot->app gap varies from day to day.
+#           Since the app computes endTime = startTime + N*60000, a
+#           millisecond-bearing startTime yields a millisecond-bearing
+#           offline moment too -- no patch needed for the end of the session.
+#           No image patch, no build, no bind mount: WEREAD_DURATION is still
+#           an INTEGER number of minutes (upstream parseInt truncates decimals).
+#   Guard : ExecStart is now a single Python entry point, `launch`, which
+#           checks launched_date in plan.json, skips if today's reading was
+#           already launched (prevents a 2nd same-day CT boot from running
+#           the whole task again + sending 2 more emails), then compose up,
+#           then marks the launch ONLY on success. A failed compose up leaves
+#           no mark so the next boot can retry. Keeping this in Python avoids
+#           systemd's $VAR expansion in ExecStart shell strings.
+#   Chain : Script A stops CT 107 @00:00 -> Script B starts it @08:00-08:30
+#           -> Script D rolls the duration -> Script D waits the ms offset
+#           -> Script D launch: guard / compose up / mark.
+#   Log   : journalctl -u weread-boot-start.service
+#           /var/log/weread-duration.log
+#   Added : 2026-11-12 (ExecStartPre for Script D added 23:15)
+#   Change: 2026-11-13 -- millisecond startup offset (plan 1).
+#           TimeoutStartSec=600 added: the Docker wait (up to 120s) plus the
+#           offset (up to 60s) exceeded systemd's 90s DefaultTimeoutStartSec,
+#           which could kill the unit BEFORE compose up ever ran.
+#   Change: 2026-11-13 -- same-day relaunch guard; ExecStart -> `launch`.
+[Unit]
+Description=WeRead challenge - start app once after CT 107 boot (Script C)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/stacks/weread-challenge
+# Docker wait (120s) + ms offset (60s) + compose up must fit in one start.
+TimeoutStartSec=600
+# Wait up to 120s for the Docker daemon to actually accept commands.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 24); do /usr/bin/docker info >/dev/null 2>&1 && exit 0; sleep 5; done; echo "Docker daemon not ready after 120s" >&2; exit 1'
+# Script D: roll today's random WEREAD_DURATION (62-120, mode 73) into the
+# YAML BEFORE compose reads it. Idempotent per calendar day.
+ExecStartPre=/usr/bin/python3 /usr/local/bin/weread-duration.py roll
+# Script D: sleep today's random millisecond offset. Idempotent per day, so a
+# unit restart on the same day will NOT add a second delay.
+ExecStartPre=/usr/bin/python3 /usr/local/bin/weread-duration.py wait
+# Script D: single decision point - guard -> compose up -> mark. No shell
+# variables here, so systemd cannot mangle them. `--dry-run` is available for
+# verification: it never spawns docker and never writes state.
+ExecStart=/usr/bin/python3 /usr/local/bin/weread-duration.py launch
+
+[Install]
+WantedBy=multi-user.target

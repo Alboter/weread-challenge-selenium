@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""微信读书挑战 stack 的每日随机调度脚本。
+
+plan   北京时间 06:00 (UTC 22:00) 执行：
+       按截断正态分布抽今天的阅读时长 60~120 分钟，原子改写 compose.yaml 的
+       WEREAD_DURATION 行；同时抽今天 08:00~08:30 之间的启动时刻，写入状态文件。
+
+launch 北京时间 08:00~08:30 (UTC 00:00~00:30) 每分钟执行：
+       到达抽中的时刻后，每天只启动一次 app 容器（强制重建，确保新的
+       WEREAD_DURATION 生效）。未到点或当天已启动则静默退出。
+
+status 查看今天的计划与 compose.yaml 当前值。
+
+容器系统时钟是 UTC，脚本内部一律按北京时间 (UTC+8) 计算，两者靠
+epoch 秒对齐，不依赖系统 localtime。
+"""
+import argparse
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+
+BJ = timezone(timedelta(hours=8))
+DEFAULT_STACK = "/opt/stacks/weread-challenge"
+DEFAULT_COMPOSE = DEFAULT_STACK + "/compose.yaml"
+DEFAULT_STATE = "/var/lib/weread-daily/plan.json"
+
+# 阅读时长（分钟）：区间约为 mu +- 2*sigma，超出区间会重新采样
+DUR_MU, DUR_SIGMA = 90.0, 15.0
+DUR_LO, DUR_HI = 60, 120
+# 启动时刻：相对北京 08:00 的分钟数；区间约为 mu +- 2*sigma
+START_MU, START_SIGMA = 15.0, 7.5
+START_LO, START_HI = 0.0, 30.0
+
+UP_CMD = ["docker", "compose", "up", "-d", "--force-recreate", "app"]
+
+# 兼容 "- WEREAD_DURATION=68" 和 "WEREAD_DURATION: '68'" 两种写法，
+# 保留缩进、引号与行尾注释，只替换数字。
+DURATION_LINE = re.compile(
+    r'^(\s*(?:-\s*)?WEREAD_DURATION\s*(?:=|:)\s*["\']?)(\d+)(["\']?\s*(?:#.*)?)$',
+    re.MULTILINE,
+)
+
+
+def truncated_normal(mu, sigma, lo, hi):
+    """截断正态：越界就重采样，保证结果严格落在 [lo, hi] 内。"""
+    for _ in range(1000):
+        x = random.gauss(mu, sigma)
+        if lo <= x <= hi:
+            return x
+    return min(max(mu, lo), hi)
+
+
+def atomic_write(path, text, mode=None):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def load_state(path):
+    try:
+        return json.loads(read_text(path))
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def bj_date(dt=None):
+    return (dt or datetime.now(BJ)).strftime("%Y-%m-%d")
+
+
+def build_plan(now):
+    duration = int(round(truncated_normal(DUR_MU, DUR_SIGMA, DUR_LO, DUR_HI)))
+    duration = min(max(duration, DUR_LO), DUR_HI)
+    offset_min = truncated_normal(START_MU, START_SIGMA, START_LO, START_HI)
+    start = datetime(now.year, now.month, now.day, 8, 0, 0, tzinfo=BJ) \
+        + timedelta(seconds=round(offset_min * 60))
+    return {
+        "date": bj_date(now),
+        "duration": duration,
+        "planned_start_epoch": start.timestamp(),
+        "planned_start_bj": start.isoformat(),
+        "launched": False,
+        "launched_at_bj": None,
+        "up_exit_code": None,
+    }
+
+
+def rewrite_duration(compose_path, duration):
+    original = read_text(compose_path)
+    hits = len(DURATION_LINE.findall(original))
+    if hits != 1:
+        raise RuntimeError(
+            "compose.yaml 里应恰好有 1 行 WEREAD_DURATION，实际 %d 行；为安全起见不修改" % hits
+        )
+    updated = DURATION_LINE.sub(
+        lambda m: m.group(1) + str(duration) + m.group(3), original, count=1
+    )
+    mode = os.stat(compose_path).st_mode & 0o777
+    atomic_write(compose_path, updated, mode)
+    return original, updated
+
+
+def save_state(path, state):
+    atomic_write(path, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+
+
+def warn_if_telemetry_on(compose_path):
+    try:
+        if "WEREAD_AGREE_TERMS" not in read_text(compose_path):
+            print("[警告] compose.yaml 未设置 WEREAD_AGREE_TERMS=false，遥测上报可能已恢复默认开启")
+    except OSError:
+        pass
+
+
+def cmd_plan(args):
+    plan = build_plan(datetime.now(BJ))
+    if args.dry_run:
+        print("[dry-run] 阅读时长 %d 分钟，计划启动 %s" % (plan["duration"], plan["planned_start_bj"]))
+        print("[dry-run] 将改写 %s，状态写入 %s" % (args.compose, args.state))
+        return
+    rewrite_duration(args.compose, plan["duration"])
+    save_state(args.state, plan)
+    print("[plan] %s WEREAD_DURATION=%d，计划启动 %s"
+          % (plan["date"], plan["duration"], plan["planned_start_bj"]))
+    warn_if_telemetry_on(args.compose)
+
+
+def cmd_launch(args):
+    state = load_state(args.state)
+    if not state or state.get("date") != bj_date():
+        # 6 点的 plan 没跑成（机器关机等），现场补一个计划，也会顺带改写 YAML
+        state = build_plan(datetime.now(BJ))
+        if args.dry_run:
+            print("[dry-run] 无当天计划，将补生成：%s" % json.dumps(state, ensure_ascii=False))
+        else:
+            rewrite_duration(args.compose, state["duration"])
+            save_state(args.state, state)
+            print("[launch] 无当天计划，已补生成 WEREAD_DURATION=%d" % state["duration"])
+
+    if state.get("launched"):
+        return
+    if not args.force and time.time() < float(state["planned_start_epoch"]):
+        return
+    if args.dry_run:
+        print("[dry-run] 将执行 cd %s && %s" % (args.stack, " ".join(UP_CMD)))
+        return
+
+    # 先落标记再执行命令，避免 up 耗时超过 1 分钟时被下一轮 cron 重复启动
+    state["launched"] = True
+    state["launched_at_bj"] = datetime.now(BJ).isoformat()
+    save_state(args.state, state)
+    try:
+        r = subprocess.run(UP_CMD, cwd=args.stack, capture_output=True,
+                           text=True, timeout=300)
+        state["up_exit_code"] = r.returncode
+        output = (r.stdout + r.stderr).strip()
+        print("[launch] %s 启动 app，exit=%d" % (state["launched_at_bj"], r.returncode))
+        if output:
+            print(output)
+    except Exception as e:
+        state["up_exit_code"] = -1
+        print("[launch] 启动失败: %s" % e)
+    save_state(args.state, state)
+
+
+def cmd_status(args):
+    state = load_state(args.state)
+    if state:
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+    else:
+        print("暂无当天计划（等待北京时间 06:00 生成）")
+    try:
+        m = DURATION_LINE.search(read_text(args.compose))
+        print("compose.yaml 当前 WEREAD_DURATION = %s" % (m.group(2) if m else "未找到"))
+        warn_if_telemetry_on(args.compose)
+    except OSError as e:
+        print("读取 compose.yaml 失败: %s" % e)
+
+
+def main():
+    p = argparse.ArgumentParser(description="微信读书每日随机时长与随机启动调度")
+    p.add_argument("action", choices=["plan", "launch", "status"])
+    p.add_argument("--dry-run", action="store_true", help="只打印将要做的事，不改文件也不启动容器")
+    p.add_argument("--force", action="store_true", help="launch 忽略计划时刻立即启动（手动补跑用）")
+    p.add_argument("--compose", default=DEFAULT_COMPOSE)
+    p.add_argument("--state", default=DEFAULT_STATE)
+    p.add_argument("--stack", default=DEFAULT_STACK)
+    args = p.parse_args()
+    try:
+        {"plan": cmd_plan, "launch": cmd_launch, "status": cmd_status}[args.action](args)
+    except Exception as e:
+        print("[错误] %s: %s" % (args.action, e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

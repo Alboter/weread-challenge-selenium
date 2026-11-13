@@ -1,0 +1,501 @@
+--- ORIGINAL/weread-duration.py
++++ CURRENT/weread-duration.py
+@@ -1,7 +1,8 @@
+ #!/usr/bin/env python3
+ # Script D -- daily random WEREAD_DURATION generator for weread-challenge.
+ #   Name   : /usr/local/bin/weread-duration.py
+-#   Caller : Script C /etc/systemd/system/weread-boot-start.service (ExecStartPre)
++#   Caller : Script C /etc/systemd/system/weread-boot-start.service
++#            ExecStartPre: roll, wait   /   ExecStart: launch
+ #   Compose: /opt/stacks/weread-challenge/compose.yaml
+ #   State  : /var/lib/weread-duration/plan.json
+ #   Backup : /var/lib/weread-duration/compose.before.yaml
+@@ -19,24 +20,57 @@
+ #            reliable once-per-day point, and running as Script C's
+ #            ExecStartPre guarantees the YAML is written BEFORE compose up.
+ #   Note   : changing an environment variable does NOT require a docker build.
+-#            The container only needs to be RECREATED, which Script C already
+-#            does with `docker compose up -d --force-recreate app`.
++#            The container only needs to be RECREATED, which Script C does
++#            with `docker compose up -d --force-recreate app`.
+ #   Added  : 2026-11-12
+ #   Change : 2026-11-12 23:20 -- mean-calibration removed per user's
+ #            clarification that "73" means the mode, not the average.
++#   Change : 2026-11-13 -- millisecond startup offset (plan 1).
++#            Each day also draws a random start_offset_ms and the new `wait`
++#            command sleeps exactly that many milliseconds before Script C
++#            runs compose up. Purpose: the app login timestamp (the ONLY
++#            online/offline moment the remote side can see) must not land on
++#            a whole minute, and the boot->app gap must vary day to day.
++#            WEREAD_DURATION is STILL an integer number of minutes: the
++#            upstream image parses it with parseInt(), so a decimal would be
++#            silently truncated. No image patch, no build, no bind mount.
++#            Because endTime = startTime + N*60000 inside the app, a
++#            millisecond-bearing startTime automatically yields a
++#            millisecond-bearing endTime as well.
++#   Change : 2026-11-13 -- same-day relaunch guard.
++#            `roll` is idempotent per calendar day, but the old ExecStart
++#            `compose up -d --force-recreate app` only skipped when the app
++#            container was RUNNING. Once it had Exited(0), a second CT 107
++#            boot on the same day would run the whole reading again and send
++#            two more emails. Script D now records launched_date /
++#            launched_at_bj via `mark`, answers `guard` with RUN/SKIP, and
++#            owns the whole decision in `launch` (Script C's ExecStart).
++#            A FAILED compose up leaves NO mark, so the next boot retries.
++#   Why a RELATIVE offset, not an absolute timestamp: Script D is invoked by
++#   Script C only AFTER CT 107 has booted, i.e. at an unpredictable moment.
++#   An absolute target inside 08:00-08:30 could already be in the past. The
++#   offset is therefore measured from the moment `wait` is called, with
++#   millisecond resolution and perf_counter calibration.
+ #
+ 
+ import argparse
++import contextlib
+ from collections import Counter
+-import fcntl
++try:
++    import fcntl
++except ImportError:      # offline validation on a non-POSIX host (Windows)
++    fcntl = None
++import io
+ import json
+ import math
+ import os
+ import random
+ import re
+ import shutil
++import subprocess
+ import sys
+ import tempfile
++import time
+ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+ 
+@@ -46,11 +80,26 @@
+ SIGMA = 12.0                 # jitter / spread; raise for wider scatter
+ LO, HI = 62.0, 120.0        # hard inclusive bounds
+ 
++# Uniform [0, 60000) ms: no centre is wanted here, the goal is to break the
++# whole-minute boundary and make the boot->app gap unpredictable. Uniform is
++# the least predictable choice; a bell-shaped offset would re-introduce a
++# characteristic "typical" gap. 1 ms resolution.
++OFFSET_MIN_MS = 0
++OFFSET_MAX_MS = 60000
++_SRNG = random.SystemRandom()   # OS entropy, not the reproducible Mersenne state
++
+ DEFAULT_COMPOSE = Path("/opt/stacks/weread-challenge/compose.yaml")
+ DEFAULT_STATE = Path("/var/lib/weread-duration/plan.json")
+ DEFAULT_BACKUP = Path("/var/lib/weread-duration/compose.before.yaml")
+-LOG_FILE = Path("/var/log/weread-duration.log")
++# Overridable only for offline validation; production (systemd) leaves it unset.
++LOG_FILE = Path(os.environ.get("WEREAD_DURATION_LOG",
++                               "/var/log/weread-duration.log"))
+ LOCK_FILE = Path("/run/weread-duration.lock")
++
++COMPOSE_UP_CMD = ["/usr/bin/docker", "compose", "up", "-d",
++                  "--force-recreate", "app"]
++COMPOSE_PS_CMD = ["/usr/bin/docker", "compose", "ps",
++                  "--status", "running", "--services"]
+ 
+ # [ \t] rather than \s: never let the pattern swallow a newline and match
+ # across lines. Exactly one such line must exist in compose.yaml.
+@@ -98,6 +147,28 @@
+     x = truncated_normal(MU, SIGMA, LO, HI)
+     n = max(int(LO), min(int(HI), int(round(x))))
+     return n, x
++
++
++def draw_offset_ms():
++    """One random millisecond offset, uniform in [OFFSET_MIN_MS, OFFSET_MAX_MS)."""
++    return _SRNG.randint(OFFSET_MIN_MS, OFFSET_MAX_MS - 1)
++
++
++def precise_sleep_ms(ms):
++    """Sleep exactly `ms` milliseconds using a monotonic-clock calibration.
++
++    time.sleep() can return early (signal) or late (scheduler granularity), so
++    recompute the remainder on every iteration and busy-wait the last 20 ms.
++    Production runs on Linux CT 107, where this reaches sub-millisecond drift.
++    """
++    deadline = time.perf_counter() + ms / 1000.0
++    while True:
++        rem = deadline - time.perf_counter()
++        if rem <= 0.0:
++            return
++        if rem > 0.020:
++            time.sleep(min(rem - 0.010, 0.5))
++        # else: tight loop for the final 20 ms
+ 
+ 
+ def log(msg, level="INFO"):
+@@ -180,8 +251,40 @@
+         "nominal_mu": round(MU, 4),
+         "sigma": SIGMA,
+         "bounds": [int(LO), int(HI)],
+-        "note": "generated by Script D (mode=73, sigma=12min)",
++        # --- millisecond startup offset (Script D / plan 1) ---
++        "start_offset_ms": draw_offset_ms(),
++        "offset_bounds_ms": [OFFSET_MIN_MS, OFFSET_MAX_MS],
++        "waited": False,
++        "waited_at_bj": None,
++        "waited_elapsed_ms": None,
++        # --- same-day relaunch guard ---
++        "launched_date": None,
++        "launched_at_bj": None,
++        "note": "generated by Script D (mode=73, sigma=12min, uniform ms offset)",
+     }
++
++
++def already_launched_today(state):
++    if not state:
++        return False
++    return state.get("launched_date") == bj_now().date().isoformat()
++
++
++def mark_launched(state, path, dry_run=False):
++    """Persist the fact that today's reading task HAS been launched."""
++    today = bj_now().date().isoformat()
++    if not state:
++        state = {"date": today, "note": "reconstructed by launch mark"}
++    if state.get("launched_date") == today:
++        return 0
++    state["launched_date"] = today
++    state["launched_at_bj"] = bj_now().isoformat()
++    if dry_run:
++        log("DRY-RUN: would mark launched_date=%s" % today)
++        return 0
++    save_state(path, state)
++    log("marked launched_date=%s at %s" % (today, state["launched_at_bj"]))
++    return 0
+ 
+ 
+ def cmd_plan(args):
+@@ -191,7 +294,8 @@
+         print(json.dumps(state, indent=2, ensure_ascii=False))
+         return 0
+     save_state(args.state, state)
+-    log("plan: WEREAD_DURATION=%d (sample=%.4f)" % (n, sample))
++    log("plan: WEREAD_DURATION=%d (sample=%.4f) start_offset_ms=%d"
++        % (n, sample, state["start_offset_ms"]))
+     return 0
+ 
+ 
+@@ -221,7 +325,8 @@
+         n = int(state["duration"])
+         cur, _ = current_duration(args.compose)
+         if cur == n:
+-            log("already applied today: WEREAD_DURATION=%d (skip)" % n)
++            log("already applied today: WEREAD_DURATION=%d, start_offset_ms=%s (skip)"
++                % (n, state.get("start_offset_ms")))
+             return 0
+         log("state says applied but YAML has %s; re-applying %d" % (cur, n))
+         old, _ = apply_duration(args.compose, n, args.backup, args.dry_run)
+@@ -238,8 +343,135 @@
+     state["applied"] = True
+     state["applied_at_bj"] = now.isoformat()
+     save_state(args.state, state)
+-    log("roll: WEREAD_DURATION %s -> %d (sample=%.4f, mode=%.1f, sigma=%.1f)"
+-        % (old, n, sample, MODE_MIN, SIGMA))
++    log("roll: WEREAD_DURATION %s -> %d (sample=%.4f, mode=%.1f, sigma=%.1f, "
++        "start_offset_ms=%d)"
++        % (old, n, sample, MODE_MIN, SIGMA, state["start_offset_ms"]))
++    return 0
++
++
++def cmd_wait(args):
++    """Sleep today's random millisecond offset. Idempotent per calendar day."""
++    state = load_state(args.state)
++    if not state:
++        log("no plan found; Script C must call 'roll' before 'wait'", "ERROR")
++        return 1
++    if "start_offset_ms" not in state:
++        # BACKWARD COMPATIBILITY: a plan.json written by pre-2026-11-13
++        # Script D has no offset fields. `roll` legitimately SKIPS when such a
++        # state says "already applied today", so the offset MUST be drawn
++        # HERE -- otherwise wait would fail and abort the whole unit before
++        # compose up ever runs. Persist it so a unit restart does not redraw.
++        state["start_offset_ms"] = draw_offset_ms()
++        state["offset_bounds_ms"] = [OFFSET_MIN_MS, OFFSET_MAX_MS]
++        state.setdefault("waited", False)
++        state.setdefault("waited_at_bj", None)
++        state.setdefault("waited_elapsed_ms", None)
++        if args.dry_run:
++            log("DRY-RUN: legacy plan.json; would draw start_offset_ms=%d"
++                % state["start_offset_ms"], "WARN")
++        else:
++            save_state(args.state, state)
++            log("migrated legacy plan.json: drew start_offset_ms=%d"
++                % state["start_offset_ms"], "WARN")
++    if state.get("date") != bj_now().date().isoformat():
++        # Do NOT fail here: roll and wait are adjacent ExecStartPre lines, so a
++        # midnight rollover between them would otherwise abort the whole unit
++        # BEFORE compose up. Script C has just run roll, so the state is fresh.
++        log("plan date %s differs from today (rollover or manual restart); "
++            "using its offset anyway" % state.get("date"), "WARN")
++    if state.get("waited") and not args.force:
++        log("already waited today (offset=%s ms), skip"
++            % state.get("start_offset_ms"))
++        return 0
++    try:
++        ms = int(state["start_offset_ms"])
++    except (KeyError, TypeError, ValueError):
++        log("state has no valid start_offset_ms; run 'roll' first", "ERROR")
++        return 1
++    if not (OFFSET_MIN_MS <= ms < OFFSET_MAX_MS):
++        log("start_offset_ms=%d out of [%d,%d)" % (ms, OFFSET_MIN_MS, OFFSET_MAX_MS),
++            "ERROR")
++        return 1
++    if args.dry_run:
++        log("DRY-RUN: would sleep %d ms (%.3f s) before compose up" % (ms, ms / 1000.0))
++        return 0
++    t0 = time.perf_counter()
++    precise_sleep_ms(ms)
++    elapsed = (time.perf_counter() - t0) * 1000.0
++    state["waited"] = True
++    state["waited_at_bj"] = bj_now().isoformat()
++    state["waited_elapsed_ms"] = round(elapsed, 3)
++    save_state(args.state, state)
++    log("wait: slept %d ms (actual %.3f ms, drift %+.3f ms)"
++        % (ms, elapsed, elapsed - ms))
++    return 0
++
++
++def cmd_guard(args):
++    """Read-only verdict for Script C. Prints exactly RUN or SKIP on stdout.
++
++    Diagnostics go to stderr so a shell can capture a single clean token.
++    Always exits 0 -- a crash is a crash, not a 'skip'.
++    """
++    state = load_state(args.state)
++    today = bj_now().date().isoformat()
++    if not state:
++        sys.stderr.write("guard: no plan.json (roll should have run first); allowing RUN\n")
++    if already_launched_today(state):
++        sys.stderr.write("guard: already launched today (%s), SKIP\n"
++                         % state.get("launched_at_bj"))
++        print("SKIP")
++    else:
++        sys.stderr.write("guard: no launch recorded for %s, RUN\n" % today)
++        print("RUN")
++    return 0
++
++
++def cmd_mark(args):
++    """Manually mark today's reading task as launched (used by launch/tests)."""
++    return mark_launched(load_state(args.state), args.state, args.dry_run)
++
++
++def cmd_launch(args):
++    """Script C's ExecStart: single decision point.
++
++    guard -> (docker compose ps) -> compose up -> mark. Only a SUCCESSFUL
++    compose up writes the mark, so a failed start can be retried next boot.
++    --dry-run never spawns docker and never writes state.
++    """
++    state = load_state(args.state)
++    today = bj_now().date().isoformat()
++    if already_launched_today(state):
++        log("launch: already launched today (%s), skip"
++            % state.get("launched_at_bj"))
++        return 0
++    if args.dry_run:
++        log("DRY-RUN: launch would check running services, then run: %s"
++            % " ".join(COMPOSE_UP_CMD))
++        return 0
++    cwd = str(args.compose.parent)
++    running = False
++    try:
++        ps = subprocess.run(COMPOSE_PS_CMD, cwd=cwd, stdout=subprocess.PIPE,
++                            stderr=subprocess.DEVNULL, text=True, timeout=30)
++        running = "app" in (ps.stdout or "").splitlines()
++    except (OSError, subprocess.SubprocessError) as e:
++        log("launch: cannot query running services (%s); proceeding" % e, "WARN")
++    if running:
++        log("launch: app already running, skip compose up")
++        return mark_launched(state, args.state)
++    log("launch: %s (cwd=%s)" % (" ".join(COMPOSE_UP_CMD), cwd))
++    try:
++        rc = subprocess.call(COMPOSE_UP_CMD, cwd=cwd, timeout=300)
++    except (OSError, subprocess.SubprocessError) as e:
++        log("launch: compose up failed (%s); NOT marking (retry next boot)" % e,
++            "ERROR")
++        return 1
++    if rc != 0:
++        log("launch: compose up rc=%d; NOT marking (retry next boot)" % rc, "ERROR")
++        return 1
++    mark_launched(state, args.state)
++    log("launch: compose up succeeded and launch marked for %s" % today)
+     return 0
+ 
+ 
+@@ -253,6 +485,16 @@
+             "nominal_mu": round(MU, 4),
+             "mean_after_truncation_informational": round(
+                 truncated_expectation(MU, SIGMA, LO, HI), 4),
++        },
++        "start_offset": {
++            "bounds_ms": [OFFSET_MIN_MS, OFFSET_MAX_MS],
++            "distribution": "uniform, 1 ms resolution",
++            "caller": "Script C ExecStartPre: weread-duration.py wait",
++        },
++        "launch_guard": {
++            "state_fields": ["launched_date", "launched_at_bj"],
++            "caller": "Script C ExecStart: weread-duration.py launch",
++            "retry_on_compose_failure": True,
+         },
+         "compose": str(args.compose),
+         "WEREAD_DURATION_in_yaml": cur,
+@@ -282,23 +524,78 @@
+           % (vals[0], p5, p50, p95, vals[-1], mean))
+     print("modal_integer=%d (count=%d)  densest_5min_window_centre=%d  all_in_window=%s"
+           % (modal_int, modal_count, peak5, in_window))
+-    ok = in_window and abs(peak5 - MODE_MIN) <= 2.0
++
++    offs = [draw_offset_ms() for _ in range(n)]
++    off_mean = sum(offs) / float(n)
++    off_ok = (min(offs) >= OFFSET_MIN_MS
++              and max(offs) < OFFSET_MAX_MS
++              and len(set(offs)) > int(0.8 * n)
++              and abs(off_mean - (OFFSET_MIN_MS + OFFSET_MAX_MS) / 2.0) < 600)
++    print("offset: bounds=[%d,%d) samples=%d unique=%d min=%d max=%d mean=%.1fms  %s"
++          % (OFFSET_MIN_MS, OFFSET_MAX_MS, n, len(set(offs)), min(offs), max(offs),
++             off_mean, "OK" if off_ok else "FAILED"))
++
++    drift = []
++    for probe in (5, 13, 37):
++        t0 = time.perf_counter()
++        precise_sleep_ms(probe)
++        drift.append((time.perf_counter() - t0) * 1000.0 - probe)
++    sleep_ok = max(abs(d) for d in drift) < 3.0
++    print("precision: probes=5/13/37ms drift_ms=%s  %s"
++          % ([round(d, 3) for d in drift], "OK" if sleep_ok else "FAILED"))
++
++    # guard/mark smoke test on a throwaway state: never touches production.
++    guard_ok = False
++    try:
++        with tempfile.TemporaryDirectory(prefix="weread-guard-") as td:
++            s = Path(td) / "plan.json"
++            ns = argparse.Namespace(state=s, dry_run=False, force=False)
++            save_state(s, {"date": bj_now().date().isoformat(),
++                           "launched_date": None, "launched_at_bj": None})
++            b1 = io.StringIO()
++            with contextlib.redirect_stdout(b1):
++                cmd_guard(ns)
++            first = b1.getvalue().strip()
++            with contextlib.redirect_stdout(io.StringIO()):
++                cmd_mark(ns)
++            b2 = io.StringIO()
++            with contextlib.redirect_stdout(b2):
++                cmd_guard(ns)
++            second = b2.getvalue().strip()
++            guard_ok = first == "RUN" and second == "SKIP"
++            print("guard/mark: fresh=%s after_mark=%s  %s"
++                  % (first, second, "OK" if guard_ok else "FAILED"))
++    except Exception as e:
++        print("guard/mark: FAILED (%s: %s)" % (type(e).__name__, e))
++
++    ok = in_window and abs(peak5 - MODE_MIN) <= 2.0 and off_ok and sleep_ok and guard_ok
+     print("SELFTEST %s" % ("OK" if ok else "FAILED"))
+     return 0 if ok else 1
+ 
+ 
+ def main():
+     p = argparse.ArgumentParser(description="Script D: daily random WEREAD_DURATION")
+-    p.add_argument("command", choices=["plan", "apply", "roll", "status", "selftest"])
++    p.add_argument("command",
++                   choices=["plan", "apply", "roll", "wait", "guard", "mark",
++                            "launch", "status", "selftest"])
+     p.add_argument("--compose", type=Path, default=DEFAULT_COMPOSE)
+     p.add_argument("--state", type=Path, default=DEFAULT_STATE)
+     p.add_argument("--backup", type=Path, default=DEFAULT_BACKUP)
+     p.add_argument("--dry-run", action="store_true")
+-    p.add_argument("--force", action="store_true")
++    p.add_argument("--force", action="store_true",
++                   help="roll: re-draw today; wait: sleep again even if waited")
+     args = p.parse_args()
+ 
++    # wait/guard/mark/launch take NO lock: Script C runs all of these
++    # serially, and a lock miss would silently skip a step (for `wait` that
++    # would start the app early -- exactly what the offset is meant to avoid).
+     lock = None
+-    if args.command in ("plan", "apply", "roll"):
++    need_lock = args.command in ("plan", "apply", "roll")
++    if need_lock and fcntl is None:
++        # Only reachable on a non-POSIX host; production CT 107 always has fcntl.
++        log("fcntl unavailable on this host; running WITHOUT the lock "
++            "(offline validation only)", "WARN")
++    elif need_lock:
+         lock = LOCK_FILE.open("a+")
+         try:
+             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+@@ -310,6 +607,10 @@
+         "plan": cmd_plan,
+         "apply": cmd_apply,
+         "roll": cmd_roll,
++        "wait": cmd_wait,
++        "guard": cmd_guard,
++        "mark": cmd_mark,
++        "launch": cmd_launch,
+         "status": cmd_status,
+         "selftest": cmd_selftest,
+     }
+--- ORIGINAL/scriptC-weread-boot-start.service
++++ CURRENT/scriptC-weread-boot-start.service
+@@ -8,10 +8,33 @@
+ #           compose.yaml; the rest of the file and the restart policy stay put
+ #           (app is a one-shot task container; restart=unless-stopped would
+ #           loop it forever after each Exited(0)).
++#   Millis: Script D also draws a random start_offset_ms every day. The `wait`
++#           ExecStartPre sleeps exactly that many milliseconds, calibrated
++#           with perf_counter, so the app login timestamp never lands on a
++#           whole minute and the boot->app gap varies from day to day.
++#           Since the app computes endTime = startTime + N*60000, a
++#           millisecond-bearing startTime yields a millisecond-bearing
++#           offline moment too -- no patch needed for the end of the session.
++#           No image patch, no build, no bind mount: WEREAD_DURATION is still
++#           an INTEGER number of minutes (upstream parseInt truncates decimals).
++#   Guard : ExecStart is now a single Python entry point, `launch`, which
++#           checks launched_date in plan.json, skips if today's reading was
++#           already launched (prevents a 2nd same-day CT boot from running
++#           the whole task again + sending 2 more emails), then compose up,
++#           then marks the launch ONLY on success. A failed compose up leaves
++#           no mark so the next boot can retry. Keeping this in Python avoids
++#           systemd's $VAR expansion in ExecStart shell strings.
+ #   Chain : Script A stops CT 107 @00:00 -> Script B starts it @08:00-08:30
+-#           -> this unit: Script D rolls the duration -> compose up app.
++#           -> Script D rolls the duration -> Script D waits the ms offset
++#           -> Script D launch: guard / compose up / mark.
+ #   Log   : journalctl -u weread-boot-start.service
++#           /var/log/weread-duration.log
+ #   Added : 2026-11-12 (ExecStartPre for Script D added 23:15)
++#   Change: 2026-11-13 -- millisecond startup offset (plan 1).
++#           TimeoutStartSec=600 added: the Docker wait (up to 120s) plus the
++#           offset (up to 60s) exceeded systemd's 90s DefaultTimeoutStartSec,
++#           which could kill the unit BEFORE compose up ever ran.
++#   Change: 2026-11-13 -- same-day relaunch guard; ExecStart -> `launch`.
+ [Unit]
+ Description=WeRead challenge - start app once after CT 107 boot (Script C)
+ After=docker.service network-online.target
+@@ -22,13 +45,20 @@
+ Type=oneshot
+ RemainAfterExit=yes
+ WorkingDirectory=/opt/stacks/weread-challenge
++# Docker wait (120s) + ms offset (60s) + compose up must fit in one start.
++TimeoutStartSec=600
+ # Wait up to 120s for the Docker daemon to actually accept commands.
+ ExecStartPre=/bin/bash -c 'for i in $(seq 1 24); do /usr/bin/docker info >/dev/null 2>&1 && exit 0; sleep 5; done; echo "Docker daemon not ready after 120s" >&2; exit 1'
+ # Script D: roll today's random WEREAD_DURATION (62-120, mode 73) into the
+ # YAML BEFORE compose reads it. Idempotent per calendar day.
+ ExecStartPre=/usr/bin/python3 /usr/local/bin/weread-duration.py roll
+-# Idempotent: skip if app is already running (e.g. launched manually in Dockge).
+-ExecStart=/bin/bash -c 'if /usr/bin/docker compose ps --status running --services 2>/dev/null | grep -qx app; then echo "weread app already running, skip"; exit 0; fi; exec /usr/bin/docker compose up -d --force-recreate app'
++# Script D: sleep today's random millisecond offset. Idempotent per day, so a
++# unit restart on the same day will NOT add a second delay.
++ExecStartPre=/usr/bin/python3 /usr/local/bin/weread-duration.py wait
++# Script D: single decision point - guard -> compose up -> mark. No shell
++# variables here, so systemd cannot mangle them. `--dry-run` is available for
++# verification: it never spawns docker and never writes state.
++ExecStart=/usr/bin/python3 /usr/local/bin/weread-duration.py launch
+ 
+ [Install]
+ WantedBy=multi-user.target

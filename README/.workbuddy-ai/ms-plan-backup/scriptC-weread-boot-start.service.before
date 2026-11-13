@@ -1,0 +1,34 @@
+# Script C -- one-shot boot trigger for the weread-challenge app inside CT 107.
+#   Name  : /etc/systemd/system/weread-boot-start.service
+#   Why   : Script A stops CT 107 at 00:00 and Script B starts it at a random
+#           moment in 08:00-08:30 CST. The app/selenium containers use
+#           restart=no, so nothing would launch the reading task after boot.
+#   Rule  : run ONCE per boot, only after the Docker daemon is ready.
+#           Script D (ExecStartPre) rewrites ONLY the WEREAD_DURATION line in
+#           compose.yaml; the rest of the file and the restart policy stay put
+#           (app is a one-shot task container; restart=unless-stopped would
+#           loop it forever after each Exited(0)).
+#   Chain : Script A stops CT 107 @00:00 -> Script B starts it @08:00-08:30
+#           -> this unit: Script D rolls the duration -> compose up app.
+#   Log   : journalctl -u weread-boot-start.service
+#   Added : 2026-11-12 (ExecStartPre for Script D added 23:15)
+[Unit]
+Description=WeRead challenge - start app once after CT 107 boot (Script C)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/stacks/weread-challenge
+# Wait up to 120s for the Docker daemon to actually accept commands.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 24); do /usr/bin/docker info >/dev/null 2>&1 && exit 0; sleep 5; done; echo "Docker daemon not ready after 120s" >&2; exit 1'
+# Script D: roll today's random WEREAD_DURATION (62-120, mode 73) into the
+# YAML BEFORE compose reads it. Idempotent per calendar day.
+ExecStartPre=/usr/bin/python3 /usr/local/bin/weread-duration.py roll
+# Idempotent: skip if app is already running (e.g. launched manually in Dockge).
+ExecStart=/bin/bash -c 'if /usr/bin/docker compose ps --status running --services 2>/dev/null | grep -qx app; then echo "weread app already running, skip"; exit 0; fi; exec /usr/bin/docker compose up -d --force-recreate app'
+
+[Install]
+WantedBy=multi-user.target
