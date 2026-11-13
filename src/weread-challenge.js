@@ -54,8 +54,8 @@ let WEREAD_AGREE_TERMS = true; // Agree to terms
 let EMAIL_PORT = 465; // SMTP port number, default 465
 let BARK_KEY = ""; // Bark推送密钥
 let BARK_SERVER = "https://api.day.app"; // Bark服务器地址
-let WXPUSH_URL = ""; // wxpush 服务地址，例如 https://xxx.workers.dev 或 https://xxx.workers.dev/wxsend
-let WXPUSH_TOKEN = ""; // wxpush 的 API_TOKEN
+let WXPUSH_URL = ""; // go-wxpush 服务地址，例如 http://go-wxpush:5566 或 http://go-wxpush:5566/wxsend
+let WXPUSH_BASE_URL = ""; // 可选：消息详情页所在站点（对应 go-wxpush 的 base_url，只填域名，不要带 /detail）
 let WEREAD_DATA_DIR = ".weread"; // 默认数据目录
 let DEFAULT_BOOK_URL =
   "https://weread.qq.com/web/reader/276323e0813ab90a5g0144d7"; // 默认阅读链接
@@ -87,7 +87,7 @@ const apiState = {
 // BARK_KEY
 // BARK_SERVER
 // WXPUSH_URL
-// WXPUSH_TOKEN
+// WXPUSH_BASE_URL
 // WEREAD_DATA_DIR
 // DEFAULT_BOOK_URL
 
@@ -111,8 +111,8 @@ const RUN_OPTION_SPECS = [
   { envKey: "EMAIL_PORT", flag: "email-port", type: "integer", description: "SMTP port." },
   { envKey: "BARK_KEY", flag: "bark-key", type: "string", description: "Bark notification key." },
   { envKey: "BARK_SERVER", flag: "bark-server", type: "string", description: "Bark server base URL." },
-  { envKey: "WXPUSH_URL", flag: "wxpush-url", type: "string", description: "wxpush service URL (e.g. https://xxx.workers.dev/wxsend)." },
-  { envKey: "WXPUSH_TOKEN", flag: "wxpush-token", type: "string", description: "wxpush API_TOKEN." },
+  { envKey: "WXPUSH_URL", flag: "wxpush-url", type: "string", description: "go-wxpush service URL (e.g. http://go-wxpush:5566)." },
+  { envKey: "WXPUSH_BASE_URL", flag: "wxpush-base-url", type: "string", description: "Optional go-wxpush base_url (site hosting the message detail page, host only)." },
   { envKey: "WEREAD_DATA_DIR", flag: "weread-data-dir", type: "string", description: "Data directory for cookies, logs and screenshots." },
   { envKey: "DEFAULT_BOOK_URL", flag: "default-book-url", type: "string", description: "Fallback reading URL." },
   { envKey: "WEREAD_API_PORT", flag: "weread-api-port", type: "integer", description: "HTTP API server port. Default: 8788. Set to 0 to disable." },
@@ -209,7 +209,7 @@ function setRuntimeConfigFromEnv(env = process.env) {
   BARK_KEY = env.BARK_KEY || "";
   BARK_SERVER = env.BARK_SERVER || "https://api.day.app";
   WXPUSH_URL = env.WXPUSH_URL || "";
-  WXPUSH_TOKEN = env.WXPUSH_TOKEN || "";
+  WXPUSH_BASE_URL = env.WXPUSH_BASE_URL || "";
   WEREAD_DATA_DIR = env.WEREAD_DATA_DIR || resolveDefaultDataDir();
   DEFAULT_BOOK_URL =
     env.DEFAULT_BOOK_URL ||
@@ -382,7 +382,6 @@ function startApiServer() {
             ...snapshot,
             EMAIL_PASS: maskSensitive(snapshot.EMAIL_PASS),
             BARK_KEY: maskSensitive(snapshot.BARK_KEY),
-            WXPUSH_TOKEN: maskSensitive(snapshot.WXPUSH_TOKEN),
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(masked));
@@ -1033,8 +1032,7 @@ async function notifyLoginLink(loginUrl) {
     tasks.push(
       sendWxpush(
         "微信读书挑战 - 请扫码登录",
-        `检测到新的登录二维码，请尽快在手机端扫码登录：${loginUrl}`,
-        { url: loginUrl }
+        `检测到新的登录二维码，请尽快在手机端扫码登录：${loginUrl}`
       )
     );
   }
@@ -1051,7 +1049,7 @@ async function notifyLoginLink(loginUrl) {
   }
 
   if (!tasks.length) {
-    console.info("未启用登录链接推送（需要 BARK_KEY、WXPUSH_URL+WXPUSH_TOKEN 或 ENABLE_EMAIL=true）");
+    console.info("未启用登录链接推送（需要 BARK_KEY、WXPUSH_URL 或 ENABLE_EMAIL=true）");
     return;
   }
 
@@ -1309,30 +1307,26 @@ async function sendBark(title, body, options = {}) {
 }
 
 function isWxpushEnabled() {
-  return Boolean(WXPUSH_URL && WXPUSH_TOKEN);
+  return Boolean(WXPUSH_URL);
 }
 
-// 启动时打印一次各推送渠道的启用状态（不输出任何密钥）
+// 启动时打印一次各推送渠道的启用状态
 function logNotifyChannels() {
-  const wxpushState = isWxpushEnabled()
-    ? "已启用"
-    : (WXPUSH_URL || WXPUSH_TOKEN)
-      ? "未启用（WXPUSH_URL 和 WXPUSH_TOKEN 需同时设置）"
-      : "未启用";
   console.info(
     `推送渠道: Bark=${BARK_KEY ? "已启用" : "未启用"}, ` +
-    `wxpush=${wxpushState}, 邮件=${ENABLE_EMAIL ? "已启用" : "未启用"}`
+    `wxpush=${isWxpushEnabled() ? "已启用" : "未启用"}, ` +
+    `邮件=${ENABLE_EMAIL ? "已启用" : "未启用"}`
   );
 }
 
-// 通过 wxpush (https://github.com/frankiejun/wxpush) 推送微信消息
-// options.url: 点击消息后的跳转地址（对应 wxpush 的 base_url 参数）
-async function sendWxpush(title, content, options = {}) {
+// 通过 go-wxpush (https://github.com/hezhizheng/go-wxpush) 推送微信消息
+// 接口：POST <WXPUSH_URL>/wxsend，JSON {title, content, base_url?}，go-wxpush 本身没有鉴权
+// 注意：go-wxpush 在微信接口报错时仍返回 HTTP 200，错误放在响应体的 errcode 里，
+//       所以成功判定为 HTTP 2xx 且 errcode 为 0（或不存在）
+async function sendWxpush(title, content) {
   if (!isWxpushEnabled()) {
     return false;
   }
-
-  const { url = "" } = options;
 
   // 允许只填域名，也允许直接填到 /wxsend
   let endpoint = WXPUSH_URL.replace(/\/+$/, "");
@@ -1341,7 +1335,7 @@ async function sendWxpush(title, content, options = {}) {
   }
 
   const payload = { title, content };
-  if (url) payload.base_url = url;
+  if (WXPUSH_BASE_URL) payload.base_url = WXPUSH_BASE_URL.replace(/\/+$/, "");
   const jsonData = JSON.stringify(payload);
   console.info("发送wxpush推送:", endpoint);
 
@@ -1359,18 +1353,25 @@ async function sendWxpush(title, content, options = {}) {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
           "Content-Length": Buffer.byteLength(jsonData),
-          "Authorization": WXPUSH_TOKEN,
           "User-Agent": "WeRead-Tracker/1.0",
         },
       }, (res) => {
         let responseData = "";
         res.on("data", (chunk) => { responseData += chunk; });
         res.on("end", () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
+          let wechatErr = null;
+          try {
+            const parsed = JSON.parse(responseData);
+            if (parsed && typeof parsed.errcode === "number" && parsed.errcode !== 0) {
+              wechatErr = `errcode=${parsed.errcode} errmsg=${parsed.errmsg || ""}`;
+            }
+          } catch (_) { /* 响应不是 JSON，只看 HTTP 状态码 */ }
+
+          if (res.statusCode >= 200 && res.statusCode < 300 && !wechatErr) {
             console.info("wxpush推送发送成功");
             resolve(true);
           } else {
-            console.error(`wxpush推送失败: ${res.statusCode} - ${responseData}`);
+            console.error(`wxpush推送失败: ${res.statusCode} - ${wechatErr || responseData.slice(0, 200)}`);
             resolve(false);
           }
         });
@@ -2475,7 +2476,7 @@ function getRuntimeConfigSnapshot() {
     BARK_KEY,
     BARK_SERVER,
     WXPUSH_URL,
-    WXPUSH_TOKEN,
+    WXPUSH_BASE_URL,
     WEREAD_DATA_DIR,
     DEFAULT_BOOK_URL,
     WEREAD_API_PORT,
