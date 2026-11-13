@@ -1312,6 +1312,19 @@ function isWxpushEnabled() {
   return Boolean(WXPUSH_URL && WXPUSH_TOKEN);
 }
 
+// 启动时打印一次各推送渠道的启用状态（不输出任何密钥）
+function logNotifyChannels() {
+  const wxpushState = isWxpushEnabled()
+    ? "已启用"
+    : (WXPUSH_URL || WXPUSH_TOKEN)
+      ? "未启用（WXPUSH_URL 和 WXPUSH_TOKEN 需同时设置）"
+      : "未启用";
+  console.info(
+    `推送渠道: Bark=${BARK_KEY ? "已启用" : "未启用"}, ` +
+    `wxpush=${wxpushState}, 邮件=${ENABLE_EMAIL ? "已启用" : "未启用"}`
+  );
+}
+
 // 通过 wxpush (https://github.com/frankiejun/wxpush) 推送微信消息
 // options.url: 点击消息后的跳转地址（对应 wxpush 的 base_url 参数）
 async function sendWxpush(title, content, options = {}) {
@@ -1889,6 +1902,8 @@ async function runMain() {
   startApiServer();
   apiState.phase = "starting";
   apiState.startTime = Date.now();
+
+  logNotifyChannels();
 
   // 发送脚本启动通知
   await sendBark("微信读书挑战", "自动阅读脚本开始运行", {
