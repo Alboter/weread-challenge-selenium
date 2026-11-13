@@ -54,6 +54,8 @@ let WEREAD_AGREE_TERMS = true; // Agree to terms
 let EMAIL_PORT = 465; // SMTP port number, default 465
 let BARK_KEY = ""; // Bark推送密钥
 let BARK_SERVER = "https://api.day.app"; // Bark服务器地址
+let WXPUSH_URL = ""; // wxpush 服务地址，例如 https://xxx.workers.dev 或 https://xxx.workers.dev/wxsend
+let WXPUSH_TOKEN = ""; // wxpush 的 API_TOKEN
 let WEREAD_DATA_DIR = ".weread"; // 默认数据目录
 let DEFAULT_BOOK_URL =
   "https://weread.qq.com/web/reader/276323e0813ab90a5g0144d7"; // 默认阅读链接
@@ -84,6 +86,8 @@ const apiState = {
 // EMAIL_TO
 // BARK_KEY
 // BARK_SERVER
+// WXPUSH_URL
+// WXPUSH_TOKEN
 // WEREAD_DATA_DIR
 // DEFAULT_BOOK_URL
 
@@ -107,6 +111,8 @@ const RUN_OPTION_SPECS = [
   { envKey: "EMAIL_PORT", flag: "email-port", type: "integer", description: "SMTP port." },
   { envKey: "BARK_KEY", flag: "bark-key", type: "string", description: "Bark notification key." },
   { envKey: "BARK_SERVER", flag: "bark-server", type: "string", description: "Bark server base URL." },
+  { envKey: "WXPUSH_URL", flag: "wxpush-url", type: "string", description: "wxpush service URL (e.g. https://xxx.workers.dev/wxsend)." },
+  { envKey: "WXPUSH_TOKEN", flag: "wxpush-token", type: "string", description: "wxpush API_TOKEN." },
   { envKey: "WEREAD_DATA_DIR", flag: "weread-data-dir", type: "string", description: "Data directory for cookies, logs and screenshots." },
   { envKey: "DEFAULT_BOOK_URL", flag: "default-book-url", type: "string", description: "Fallback reading URL." },
   { envKey: "WEREAD_API_PORT", flag: "weread-api-port", type: "integer", description: "HTTP API server port. Default: 8788. Set to 0 to disable." },
@@ -202,6 +208,8 @@ function setRuntimeConfigFromEnv(env = process.env) {
     : parseIntegerValue(env.EMAIL_PORT, "email-port");
   BARK_KEY = env.BARK_KEY || "";
   BARK_SERVER = env.BARK_SERVER || "https://api.day.app";
+  WXPUSH_URL = env.WXPUSH_URL || "";
+  WXPUSH_TOKEN = env.WXPUSH_TOKEN || "";
   WEREAD_DATA_DIR = env.WEREAD_DATA_DIR || resolveDefaultDataDir();
   DEFAULT_BOOK_URL =
     env.DEFAULT_BOOK_URL ||
@@ -374,6 +382,7 @@ function startApiServer() {
             ...snapshot,
             EMAIL_PASS: maskSensitive(snapshot.EMAIL_PASS),
             BARK_KEY: maskSensitive(snapshot.BARK_KEY),
+            WXPUSH_TOKEN: maskSensitive(snapshot.WXPUSH_TOKEN),
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(masked));
@@ -1020,6 +1029,16 @@ async function notifyLoginLink(loginUrl) {
     );
   }
 
+  if (isWxpushEnabled()) {
+    tasks.push(
+      sendWxpush(
+        "微信读书挑战 - 请扫码登录",
+        `检测到新的登录二维码，请尽快在手机端扫码登录：${loginUrl}`,
+        { url: loginUrl }
+      )
+    );
+  }
+
   if (canSendLoginLinkEmail()) {
     tasks.push(
       sendMail(
@@ -1032,7 +1051,7 @@ async function notifyLoginLink(loginUrl) {
   }
 
   if (!tasks.length) {
-    console.info("未启用登录链接推送（需要 BARK_KEY 或 ENABLE_EMAIL=true）");
+    console.info("未启用登录链接推送（需要 BARK_KEY、WXPUSH_URL+WXPUSH_TOKEN 或 ENABLE_EMAIL=true）");
     return;
   }
 
@@ -1285,6 +1304,78 @@ async function sendBark(title, body, options = {}) {
     });
   } catch (error) {
     console.error("Bark推送异常:", error);
+    return false;
+  }
+}
+
+function isWxpushEnabled() {
+  return Boolean(WXPUSH_URL && WXPUSH_TOKEN);
+}
+
+// 通过 wxpush (https://github.com/frankiejun/wxpush) 推送微信消息
+// options.url: 点击消息后的跳转地址（对应 wxpush 的 base_url 参数）
+async function sendWxpush(title, content, options = {}) {
+  if (!isWxpushEnabled()) {
+    return false;
+  }
+
+  const { url = "" } = options;
+
+  // 允许只填域名，也允许直接填到 /wxsend
+  let endpoint = WXPUSH_URL.replace(/\/+$/, "");
+  if (!/\/wxsend$/.test(endpoint)) {
+    endpoint += "/wxsend";
+  }
+
+  const payload = { title, content };
+  if (url) payload.base_url = url;
+  const jsonData = JSON.stringify(payload);
+  console.info("发送wxpush推送:", endpoint);
+
+  try {
+    const urlObj = new URL(endpoint);
+    const httpModule = urlObj.protocol === "https:" ? https : http;
+
+    return await new Promise((resolve) => {
+      const req = httpModule.request({
+        hostname: urlObj.hostname,
+        port: urlObj.port || (urlObj.protocol === "https:" ? 443 : 80),
+        path: urlObj.pathname + urlObj.search,
+        method: "POST",
+        timeout: 15000,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Length": Buffer.byteLength(jsonData),
+          "Authorization": WXPUSH_TOKEN,
+          "User-Agent": "WeRead-Tracker/1.0",
+        },
+      }, (res) => {
+        let responseData = "";
+        res.on("data", (chunk) => { responseData += chunk; });
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            console.info("wxpush推送发送成功");
+            resolve(true);
+          } else {
+            console.error(`wxpush推送失败: ${res.statusCode} - ${responseData}`);
+            resolve(false);
+          }
+        });
+      });
+
+      req.on("timeout", () => {
+        req.destroy(new Error("请求超时"));
+      });
+      req.on("error", (error) => {
+        console.error("wxpush推送请求错误:", error.message);
+        resolve(false);
+      });
+
+      req.write(jsonData);
+      req.end();
+    });
+  } catch (error) {
+    console.error("wxpush推送异常:", error);
     return false;
   }
 }
@@ -1805,6 +1896,7 @@ async function runMain() {
     level: "active",
     sound: "beginning"
   });
+  await sendWxpush("微信读书挑战 - 脚本启动", "自动阅读脚本开始运行");
   try {
     const capabilities = {
       browserName: WEREAD_BROWSER,
@@ -2032,6 +2124,7 @@ async function runMain() {
         level: "critical",
         sound: "alarm"
       });
+      await sendWxpush("微信读书挑战 - 登录失败", "登录失败，请检查登录状态或重新扫码登录");
       return;
     }
 
@@ -2118,6 +2211,7 @@ async function runMain() {
       level: "active",
       sound: "birdsong"
     });
+    await sendWxpush("微信读书挑战 - 登录成功", "登录成功，开始阅读");
 
     // run script to keep reading
     // let script = fs.readFileSync("./src/keep_reading.js", "utf8");
@@ -2302,6 +2396,7 @@ async function runMain() {
       level: "active",
       sound: "success"
     });
+    await sendWxpush("微信读书挑战 - 阅读完成", `阅读完成，持续时间：${WEREAD_DURATION}分钟`);
   } catch (e) {
     // Add line number to error message if possible
     let errorMessage = String(e?.message || e || "Unknown error");
@@ -2325,6 +2420,10 @@ async function runMain() {
       level: "critical",
       sound: "alarm"
     });
+    await sendWxpush(
+      "微信读书挑战 - 发生错误",
+      `发生错误：${errorMessage.substring(0, 100)}${errorMessage.length > 100 ? '...' : ''}`
+    );
 
     if (WEREAD_AGREE_TERMS) {
       logEventToWereadLog(errorMessage);
@@ -2360,6 +2459,8 @@ function getRuntimeConfigSnapshot() {
     EMAIL_PORT,
     BARK_KEY,
     BARK_SERVER,
+    WXPUSH_URL,
+    WXPUSH_TOKEN,
     WEREAD_DATA_DIR,
     DEFAULT_BOOK_URL,
     WEREAD_API_PORT,
